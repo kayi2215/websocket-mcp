@@ -18,13 +18,22 @@ class WebSocketAgent:
         if not self.api_key:
             logger.error("OPENAI_API_KEY environment variable is not set")
             raise ValueError("OPENAI_API_KEY environment variable is not set")
-        self.client = AsyncOpenAI(
-            api_key=self.api_key
-        )
-        self.system_prompt = """You are an AI assistant helping users interact with various tools.
-You should help users accomplish their tasks by using the available tools when appropriate.
+        self.client = AsyncOpenAI(api_key=self.api_key)
+        self.system_prompt = """You are an AI assistant integrated with an MCP (Multi-tool Command Protocol) system.
+Your primary role is to help users interact with various tools through the MCP protocol.
+When users request actions like creating folders or files, you should:
+1. Identify the appropriate MCP tool for the task
+2. Use the tool with the correct parameters
+3. Provide feedback about the action's success or failure
+
+For example, if a user asks to create a folder, you should:
+- Use the appropriate MCP file system tool
+- Pass the correct path and parameters
+- Confirm the creation or explain any errors
+
+Always try to understand the user's intent and use the available tools appropriately.
 Respond in a helpful and conversational manner."""
-        self.messages = []
+        self.messages = [{"role": "system", "content": self.system_prompt}]
         self.tool_manager = MCPToolManager()
         
     def set_available_tools(self, tools: List[Dict[str, Any]]):
@@ -93,6 +102,7 @@ Respond in a helpful and conversational manner."""
             if message.tool_calls:
                 logger.info("Model wants to use tools")
                 tool_responses = []
+                
                 for tool_call in message.tool_calls:
                     try:
                         tool_request = {

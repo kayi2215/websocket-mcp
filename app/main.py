@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 from asyncio import CancelledError
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+from app.agent import WebSocketAgent
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, 
@@ -22,6 +23,9 @@ logger = logging.getLogger(__name__)
 # Define paths
 ROOT_DIR = str(Path(__file__).parent.parent.parent.parent)
 CONFIG_PATH = str(Path(__file__).parent.parent / "config" / "mcp-servers.json")
+
+# Initialize the GPT agent
+agent = WebSocketAgent()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -329,6 +333,11 @@ class MCPManager:
         if errors:
             raise Exception("; ".join(errors))
 
+    async def process_message(self, message: str, servers: List[str]) -> str:
+        """Process a message with the AI agent"""
+        # TO DO: implement AI agent processing
+        return message
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, WebSocket] = {}  # client_id -> WebSocket
@@ -425,6 +434,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
         # Send available tools
         try:
             tools = await mcp_manager.get_tools()
+            agent.set_available_tools(tools)  # Update agent's tools
             await websocket.send_json({
                 "type": "tools",
                 "tools": tools
@@ -442,37 +452,27 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                 message = await websocket.receive_json()
                 logger.info(f"Received message from client {client_id}: {message}")
                 
-                if "type" not in message:
-                    await websocket.send_json({
-                        "type": "error",
-                        "message": "Message must include 'type' field"
-                    })
-                    continue
-
                 if message["type"] == "connect":
-                    server_name = message.get("server")
-                    if not server_name:
-                        await websocket.send_json({
-                            "type": "error", 
-                            "message": "server name is required"
-                        })
-                        continue
-
+                    server_name = message["server"]
+                    logger.info(f"Client {client_id} requesting connection to server {server_name}")
+                    
                     try:
-                        success = await mcp_manager.ensure_connection(server_name)
-                        if success:
-                            manager.add_server_connection(client_id, server_name)
-                            await websocket.send_json({
-                                "type": "connect_response",
-                                "status": "success",
-                                "server": server_name
-                            })
-                            logger.info(f"Client {client_id} connected to server {server_name}")
-                        else:
-                            await websocket.send_json({
-                                "type": "error",
-                                "message": f"Failed to connect to server {server_name}"
-                            })
+                        await mcp_manager.connect_to_server(server_name)
+                        manager.add_server_connection(client_id, server_name)
+                        
+                        await websocket.send_json({
+                            "type": "connection_established",
+                            "server": server_name
+                        })
+                        
+                        # Update tools after new connection
+                        tools = await mcp_manager.get_tools()
+                        agent.set_available_tools(tools)  # Update agent's tools
+                        await websocket.send_json({
+                            "type": "tools",
+                            "tools": tools
+                        })
+                        
                     except Exception as e:
                         logger.error(f"Error connecting to server {server_name}: {e}")
                         await websocket.send_json({
@@ -480,41 +480,45 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
                             "message": f"Error connecting to server: {str(e)}"
                         })
 
-                elif message["type"] == "message":
-                    content = message.get("content")
-                    if not content:
+                elif message["type"] == "agent_message":
+                    # Process message with GPT agent
+                    try:
+                        response = await agent.process_message(message["content"])
+                        await websocket.send_json({
+                            "type": "response",
+                            "content": response
+                        })
+                    except Exception as e:
+                        logger.error(f"Error processing message with agent: {e}")
                         await websocket.send_json({
                             "type": "error",
-                            "message": "Message content is required"
+                            "message": f"Error processing message: {str(e)}"
                         })
-                        continue
-
-                    # Echo back for now
-                    await websocket.send_json({
-                        "type": "response",
-                        "content": f"Echo: {content}"
-                    })
-                    
-            except WebSocketDisconnect:
-                logger.info(f"Client {client_id} disconnected")
-                break
-            except Exception as e:
-                logger.error(f"Error processing message from client {client_id}: {e}")
-                try:
+                
+                else:
                     await websocket.send_json({
                         "type": "error",
-                        "message": "Internal server error"
+                        "message": "Unknown message type"
                     })
-                except:
-                    break
+                    
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON received from client {client_id}")
+                await websocket.send_json({
+                    "type": "error",
+                    "message": "Invalid message format"
+                })
+                
+            except Exception as e:
+                logger.error(f"Error processing message from client {client_id}: {e}")
+                await websocket.send_json({
+                    "type": "error",
+                    "message": str(e)
+                })
                 
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected")
-    except Exception as e:
-        logger.error(f"Error in websocket connection for client {client_id}: {e}")
-    finally:
-        await manager.disconnect(websocket)
-
+        manager.disconnect(websocket)
+        
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
